@@ -1,6 +1,7 @@
 import io
 import os
 import struct
+import base64
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple, List
@@ -562,6 +563,45 @@ def call_openai(prompt: str, model: str = "gpt-4.1-mini") -> str:
     return str(r.json()["choices"][0]["message"]["content"]).strip()
 
 
+
+def gemini_available() -> bool:
+    return bool(safe_get_secret("GEMINI_API_KEY", ""))
+
+
+def call_gemini_vision(prompt: str, image_bytes_list: List[bytes], model: str = "gemini-2.5-flash") -> str:
+    api_key = safe_get_secret("GEMINI_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY not configured.")
+    parts = []
+    for img in image_bytes_list:
+        parts.append({
+            "inlineData": {
+                "mimeType": "image/png",
+                "data": base64.b64encode(img).decode("utf-8"),
+            }
+        })
+    parts.append({"text": prompt})
+    r = requests.post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+        headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
+        json={"contents": [{"role": "user", "parts": parts}]},
+        timeout=120,
+    )
+    r.raise_for_status()
+    data = r.json()
+    try:
+        return str(data["candidates"][0]["content"]["parts"][0]["text"]).strip()
+    except Exception as e:
+        raise RuntimeError(f"Gemini response parse failed: {e}; payload keys: {list(data.keys())}")
+
+
+def figure_to_png_bytes(fig) -> bytes:
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=180, bbox_inches="tight")
+    buf.seek(0)
+    return buf.read()
+
+
 def generate_guidance(project: RadanProject, notes: List[str], candidates: pd.DataFrame, prefer_local: bool, ollama_model: str, ollama_url: str, openai_model: str) -> Tuple[str, str]:
     primary = project.dzt or project.dzg or project.dzx or project.dza
     meta = primary.metadata if primary else {}
@@ -673,7 +713,9 @@ def sidebar_controls(n_traces: int, n_samples: int) -> Dict[str, Any]:
 
     st.sidebar.header("AI Guidance")
     ai_enable = st.sidebar.checkbox("Enable optional AI guidance", value=False)
-    prefer_local = st.sidebar.checkbox("Prefer local Ollama", value=True)
+    use_gemini_vision = st.sidebar.checkbox("Use Gemini vision review when available", value=True)
+    gemini_model = st.sidebar.text_input("Gemini model", value="gemini-2.5-flash")
+    prefer_local = st.sidebar.checkbox("Prefer local Ollama for text guidance", value=True)
     ollama_model = st.sidebar.text_input("Ollama model", value="llama3.1:8b")
     ollama_url = st.sidebar.text_input("Ollama URL", value="http://127.0.0.1:11434")
     openai_model = st.sidebar.text_input("OpenAI model", value="gpt-4.1-mini")
@@ -698,6 +740,8 @@ def sidebar_controls(n_traces: int, n_samples: int) -> Dict[str, Any]:
         "light_smooth_on": light_smooth_on,
         "light_smooth_passes": light_smooth_passes,
         "ai_enable": ai_enable,
+        "use_gemini_vision": use_gemini_vision,
+        "gemini_model": gemini_model,
         "prefer_local": prefer_local,
         "ollama_model": ollama_model,
         "ollama_url": ollama_url,
