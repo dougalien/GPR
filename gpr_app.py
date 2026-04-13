@@ -1,4 +1,3 @@
-
 import io
 import os
 import struct
@@ -6,23 +5,25 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple, List
 
-import requests
 import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
-from scipy.ndimage import gaussian_filter, uniform_filter, maximum_filter
 
 
+# -----------------------------
+# Data structures
+# -----------------------------
 @dataclass
 class GPRData:
     file_type: str
     source_file: str
-    traces: Optional[np.ndarray] = None
+    traces: Optional[np.ndarray] = None  # shape: (n_traces, n_samples)
     time_axis: Optional[np.ndarray] = None
     distance_axis: Optional[np.ndarray] = None
     gps: Optional[Dict[str, Any]] = None
-    marks: Optional[np.ndarray] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
     raw_bytes: Optional[bytes] = None
 
@@ -49,19 +50,84 @@ class RadanProject:
     files: Dict[str, str] = field(default_factory=dict)
 
 
-@dataclass
-class ProcessedGPR:
-    raw: np.ndarray
-    processed: np.ndarray
-    time_axis: np.ndarray
-    distance_axis: np.ndarray
-    notes: List[str]
-    disturbance_score: np.ndarray
-    hyperbola_score: np.ndarray
-    reflector_score: np.ndarray
-    candidate_table: pd.DataFrame
+# -----------------------------
+# Helpers
+# -----------------------------
+def safe_get_secret(name: str, default: str = "") -> str:
+    try:
+        return str(st.secrets.get(name, default))
+    except Exception:
+        return str(os.getenv(name, default))
 
 
+def moving_average_1d(y: np.ndarray, window: int) -> np.ndarray:
+    window = max(3, int(window))
+    if window % 2 == 0:
+        window += 1
+    kernel = np.ones(window, dtype=float) / window
+    return np.convolve(y, kernel, mode="same")
+
+
+def running_mean_rows(arr: np.ndarray, window: int) -> np.ndarray:
+    return np.vstack([moving_average_1d(row, window) for row in arr])
+
+
+def gaussian_like_smooth_rows(arr: np.ndarray, passes: int = 2) -> np.ndarray:
+    out = arr.copy().astype(float)
+    kernel = np.array([1, 2, 1], dtype=float) / 4.0
+    for _ in range(max(1, passes)):
+        out = np.vstack([np.convolve(r, kernel, mode="same") for r in out])
+    return out
+
+
+def normalize_per_trace(arr: np.ndarray) -> np.ndarray:
+    out = arr.astype(float).copy()
+    scale = np.max(np.abs(out), axis=1, keepdims=True)
+    scale[scale == 0] = 1.0
+    return out / scale
+
+
+def linear_gain(n_samples: int, strength: float) -> np.ndarray:
+    return np.linspace(1.0, 1.0 + max(0.0, strength), n_samples)
+
+
+def exponential_gain(n_samples: int, strength: float) -> np.ndarray:
+    x = np.linspace(0.0, 1.0, n_samples)
+    return np.exp(max(0.0, strength) * x)
+
+
+def robust_clip_limits(data: np.ndarray, low_pct: float, high_pct: float) -> Tuple[float, float]:
+    return float(np.percentile(data, low_pct)), float(np.percentile(data, high_pct))
+
+
+def axis_extent(gpr_data: GPRData, invert_y: bool, trace_start: int = 0, trace_end: Optional[int] = None,
+                sample_start: int = 0, sample_end: Optional[int] = None, use_distance: bool = True) -> Tuple[List[float], str, str]:
+    arr = gpr_data.traces
+    n_traces, n_samples = arr.shape
+    trace_end = n_traces if trace_end is None else trace_end
+    sample_end = n_samples if sample_end is None else sample_end
+
+    if use_distance and gpr_data.distance_axis is not None and len(gpr_data.distance_axis) == n_traces:
+        x_vals = gpr_data.distance_axis[trace_start:trace_end]
+        xlabel = "Distance"
+    else:
+        x_vals = np.arange(trace_start, trace_end)
+        xlabel = "Trace Number"
+
+    if gpr_data.time_axis is not None and len(gpr_data.time_axis) == n_samples:
+        y_vals = gpr_data.time_axis[sample_start:sample_end]
+        ylabel = "Time (ns)"
+    else:
+        y_vals = np.arange(sample_start, sample_end)
+        ylabel = "Sample"
+
+    extent = [x_vals[0], x_vals[-1], y_vals[-1], y_vals[0]] if invert_y else [x_vals[0], x_vals[-1], y_vals[0], y_vals[-1]]
+    return extent, xlabel, ylabel
+
+
+# -----------------------------
+# File reading / grouping
+# -----------------------------
 def inspect_uploaded_file(name: str, content: bytes) -> FileInspection:
     ext = Path(name).suffix.lower()
     size = len(content)
@@ -89,33 +155,16 @@ def inspect_uploaded_file(name: str, content: bytes) -> FileInspection:
                 likely_type = "plain_text"
                 notes = "Looks like plain text."
     else:
-        if ext == ".dzt":
-            likely_type = "gssi_dzt"
-            notes = "Binary file with .dzt extension; likely GSSI radar data."
-        elif ext == ".tmf":
-            likely_type = "gssi_tmf"
-            notes = "Binary file with .tmf extension; likely timing/mark file."
-        elif ext == ".dza":
-            likely_type = "gssi_dza"
-            notes = "Binary file with .dza extension; likely auxiliary line trace data."
-        else:
-            likely_type = "binary_unknown"
-            notes = "Binary file but format not yet supported."
+        likely_map = {".dzt": "gssi_dzt", ".tmf": "gssi_tmf", ".dza": "gssi_dza", ".dzg": "gssi_dzg", ".dzx": "gssi_dzx"}
+        likely_type = likely_map.get(ext, "binary_unknown")
+        notes = f"Binary file with {ext} extension."
 
-    return FileInspection(
-        source_file=name,
-        extension=ext,
-        size_bytes=size,
-        is_binary=is_binary,
-        likely_type=likely_type,
-        notes=notes,
-        preview_text=preview_text,
-    )
+    return FileInspection(name, ext, size, is_binary, likely_type, notes, preview_text)
 
 
 def parse_dzt(name: str, content: bytes) -> GPRData:
     if len(content) < 1024:
-        raise ValueError("File too small to contain a valid 1024-byte DZT header.")
+        raise ValueError("File too small for a valid 1024-byte DZT header.")
 
     header = content[:1024]
     data = content[1024:]
@@ -127,14 +176,10 @@ def parse_dzt(name: str, content: bytes) -> GPRData:
     rhf_spm = struct.unpack_from("<f", header, 84)[0]
     rhf_position = struct.unpack_from("<f", header, 88)[0]
     rhf_range = struct.unpack_from("<f", header, 92)[0]
-
-    try:
-        rh_nchan = struct.unpack_from("<h", header, 54)[0]
-    except Exception:
-        rh_nchan = 1
+    rh_nchan = struct.unpack_from("<h", header, 54)[0] if len(header) >= 56 else 1
 
     if rh_nsamp <= 0:
-        raise ValueError(f"Invalid samples/trace value: {rh_nsamp}")
+        raise ValueError(f"Invalid samples per trace: {rh_nsamp}")
 
     if rh_bits == 8:
         dtype = np.uint8
@@ -147,15 +192,15 @@ def parse_dzt(name: str, content: bytes) -> GPRData:
 
     trace_size = rh_nsamp * bytes_per_sample
     n_traces = len(data) // trace_size
-    if trace_size <= 0 or n_traces == 0:
-        raise ValueError("No usable trace data found after header.")
+    if n_traces == 0:
+        raise ValueError("No usable trace data found.")
 
     usable = n_traces * trace_size
     raw = np.frombuffer(data[:usable], dtype=dtype).reshape(n_traces, rh_nsamp)
-    centered = raw.astype(np.float32) - float(rh_zero)
+    centered = raw.astype(np.int32) - rh_zero
 
-    time_axis = np.linspace(0, rhf_range, rh_nsamp) if rhf_range and rhf_range > 0 else np.arange(rh_nsamp, dtype=float)
-    distance_axis = np.arange(n_traces) / rhf_spm if rhf_spm and rhf_spm > 0 else np.arange(n_traces, dtype=float)
+    time_axis = np.linspace(0, rhf_range, rh_nsamp) if rhf_range and rhf_range > 0 else None
+    distance_axis = np.arange(n_traces) / rhf_spm if rhf_spm and rhf_spm > 0 else None
 
     metadata = {
         "samples_per_trace": int(rh_nsamp),
@@ -166,97 +211,60 @@ def parse_dzt(name: str, content: bytes) -> GPRData:
         "position_ns": float(rhf_position),
         "range_ns": float(rhf_range),
         "channels": int(rh_nchan),
-        "header_size_bytes": 1024,
         "n_traces": int(n_traces),
-        "usable_data_bytes": int(usable),
-        "leftover_bytes": int(len(data) - usable),
+        "header_size_bytes": 1024,
     }
-
-    return GPRData(
-        file_type="dzt",
-        source_file=name,
-        traces=centered,
-        time_axis=time_axis,
-        distance_axis=distance_axis,
-        metadata=metadata,
-    )
+    return GPRData("dzt", name, centered, time_axis, distance_axis, metadata=metadata, raw_bytes=content)
 
 
-def parse_csv(name: str, content: bytes) -> GPRData:
-    df = pd.read_csv(io.BytesIO(content))
-    numeric_df = df.select_dtypes(include=[np.number])
-    traces = numeric_df.to_numpy(dtype=float) if not numeric_df.empty else None
-    return GPRData(
-        file_type="csv",
-        source_file=name,
-        traces=traces,
-        metadata={"columns": list(df.columns), "n_rows": int(len(df)), "n_numeric_columns": int(len(numeric_df.columns))},
-    )
-
-
-def parse_text(name: str, content: bytes, forced_type: str = "text") -> GPRData:
+def parse_csv_or_text_matrix(name: str, content: bytes, forced_type: str = "text") -> GPRData:
+    # Try CSV, tab, whitespace. Expect rows=traces and cols=samples or vice versa.
     text = content.decode("utf-8", errors="ignore")
-    gps = None
-    if "$GPGGA" in text or "$GNGGA" in text:
-        gps = {"note": "NMEA GPS strings detected"}
-
-    traces = None
-    delimiter_used = None
-    for delimiter in [",", "\t", None]:
+    df = None
+    for sep in [",", "\t", None]:
         try:
-            if delimiter is None:
-                df = pd.read_csv(io.StringIO(text), sep=r"\s+", header=None)
-                delimiter_used = "whitespace"
+            if sep is None:
+                tmp = pd.read_csv(io.StringIO(text), sep=r"\s+", header=None)
             else:
-                df = pd.read_csv(io.StringIO(text), sep=delimiter, header=None)
-                delimiter_used = repr(delimiter)
-            if not df.empty:
-                numeric_df = df.apply(pd.to_numeric, errors="coerce").dropna(axis=1, how="all")
-                if not numeric_df.empty:
-                    traces = numeric_df.to_numpy(dtype=float)
+                tmp = pd.read_csv(io.StringIO(text), sep=sep, header=None)
+            if not tmp.empty:
+                df = tmp.apply(pd.to_numeric, errors="coerce").dropna(axis=1, how="all")
+                if not df.empty:
                     break
         except Exception:
             continue
+    if df is None or df.empty:
+        raise ValueError("Could not parse text matrix.")
 
-    return GPRData(
-        file_type=forced_type,
-        source_file=name,
-        traces=traces,
-        gps=gps,
-        metadata={"length_chars": len(text), "preview": text[:300], "parsed_delimiter": delimiter_used},
-        raw_bytes=content,
-    )
+    arr = df.to_numpy(dtype=float)
+    # Heuristic: if fewer rows than cols, rows are likely traces? keep as is if many rows.
+    if arr.shape[0] < arr.shape[1] and arr.shape[0] < 80:
+        arr = arr.T
+
+    metadata = {"n_traces": int(arr.shape[0]), "samples_per_trace": int(arr.shape[1]), "parsed_from": forced_type}
+    return GPRData(forced_type, name, arr, time_axis=np.arange(arr.shape[1]), distance_axis=np.arange(arr.shape[0]), metadata=metadata, raw_bytes=content)
 
 
-def parse_dza(name: str, content: bytes) -> GPRData:
-    inspection = inspect_uploaded_file(name, content)
-    if inspection.is_binary:
-        return GPRData(
-            file_type="dza",
-            source_file=name,
-            metadata={"note": "DZA detected. Binary auxiliary line trace parsing not implemented yet.", "size_bytes": len(content), "likely_type": inspection.likely_type},
-            raw_bytes=content,
-        )
-    return parse_text(name, content, forced_type="dza")
+def parse_text_sidecar(name: str, content: bytes, forced_type: str) -> GPRData:
+    text = content.decode("utf-8", errors="ignore")
+    gps = None
+    if "$GPGGA" in text or "$GNGGA" in text:
+        gps = {"note": "NMEA GPS strings detected", "preview": text[:300]}
+    return GPRData(forced_type, name, gps=gps, metadata={"preview": text[:300], "length_chars": len(text)}, raw_bytes=content)
 
 
 def load_uploaded_file(uploaded_file) -> Tuple[Optional[GPRData], Optional[FileInspection]]:
     name = uploaded_file.name
     content = uploaded_file.getvalue()
     ext = Path(name).suffix.lower()
-
     if ext == ".dzt":
         return parse_dzt(name, content), None
     if ext == ".csv":
-        return parse_csv(name, content), None
+        return parse_csv_or_text_matrix(name, content, "csv"), None
     if ext in {".txt", ".asc"}:
-        return parse_text(name, content), None
-    if ext == ".dzg":
-        return parse_text(name, content, forced_type="dzg"), inspect_uploaded_file(name, content)
-    if ext == ".dzx":
-        return parse_text(name, content, forced_type="dzx"), inspect_uploaded_file(name, content)
-    if ext == ".dza":
-        return parse_dza(name, content), inspect_uploaded_file(name, content)
+        return parse_csv_or_text_matrix(name, content, ext.lstrip('.')), None
+    if ext in {".dzg", ".dzx", ".dza"}:
+        return parse_text_sidecar(name, content, ext.lstrip('.')), inspect_uploaded_file(name, content)
     return None, inspect_uploaded_file(name, content)
 
 
@@ -266,9 +274,13 @@ def build_projects_from_uploads(uploaded_files) -> Dict[str, RadanProject]:
         stem = Path(uploaded_file.name).stem
         project = projects.setdefault(stem, RadanProject(stem=stem))
         parsed, inspection = load_uploaded_file(uploaded_file)
-        ext = Path(uploaded_file.name).suffix.lower().lstrip(".")
+        ext = Path(uploaded_file.name).suffix.lower().lstrip('.')
         if ext in {"dzt", "dzg", "dzx", "dza"} and parsed is not None:
             setattr(project, ext, parsed)
+            project.files[ext] = uploaded_file.name
+        elif parsed is not None and ext in {"csv", "txt", "asc"}:
+            # Treat matrix file as primary if no dzt
+            project.dzt = parsed
             project.files[ext] = uploaded_file.name
         else:
             if inspection is None:
@@ -277,312 +289,294 @@ def build_projects_from_uploads(uploaded_files) -> Dict[str, RadanProject]:
     return projects
 
 
-def moving_average_1d(arr: np.ndarray, window: int) -> np.ndarray:
-    window = max(3, int(window))
-    if window % 2 == 0:
-        window += 1
-    kernel = np.ones(window, dtype=float) / window
-    return np.convolve(arr, kernel, mode="same")
+# -----------------------------
+# Demo raw data
+# -----------------------------
+def build_plain_training_line() -> GPRData:
+    n_traces = 200
+    n_samples = 320
+    rng = np.random.default_rng(42)
+    t = np.linspace(0, 120, n_samples)
+    x = np.linspace(0, 20, n_traces)
 
+    data = rng.normal(0, 8, size=(n_traces, n_samples))
 
-def dewow(traces: np.ndarray, window: int) -> np.ndarray:
-    out = np.empty_like(traces, dtype=float)
-    for i in range(traces.shape[0]):
-        out[i] = traces[i] - moving_average_1d(traces[i], window)
-    return out
+    # Horizontal banding / coupling / shallow reflections
+    shallow = 18 + (2.0 * np.sin(np.arange(n_traces) / 18.0)).astype(int)
+    for i in range(n_traces):
+        idx = shallow[i]
+        data[i, max(0, idx - 1):min(n_samples, idx + 2)] += 45
 
+    horizon1 = 95 + (3.0 * np.sin(np.arange(n_traces) / 35.0)).astype(int)
+    horizon2 = 155 + (5.0 * np.sin(np.arange(n_traces) / 24.0)).astype(int)
+    for i in range(n_traces):
+        data[i, max(0, horizon1[i] - 1):min(n_samples, horizon1[i] + 2)] += 28
+        data[i, max(0, horizon2[i] - 1):min(n_samples, horizon2[i] + 2)] += 20
 
-def apply_time_zero_shift(traces: np.ndarray, shift_samples: int) -> np.ndarray:
-    if shift_samples == 0:
-        return traces.copy()
-    shifted = np.zeros_like(traces)
-    if shift_samples > 0:
-        shifted[:, :-shift_samples] = traces[:, shift_samples:]
-    else:
-        shifted[:, -shift_samples:] = traces[:, :shift_samples]
-    return shifted
+    # Disturbed zones without explicit perfect targets
+    disturbed_cols = [(46, 58), (102, 114), (148, 160)]
+    for a, b in disturbed_cols:
+        data[a:b, :] *= 0.90
+        for i in range(a, b):
+            h1 = horizon1[i] + rng.integers(-6, 7)
+            h2 = horizon2[i] + rng.integers(-10, 11)
+            data[i, max(0, h1 - 1):min(n_samples, h1 + 2)] += rng.normal(8, 6)
+            data[i, max(0, h2 - 1):min(n_samples, h2 + 2)] += rng.normal(6, 5)
 
+    # Mild ambiguous hyperbola-like clutter, not textbook clean
+    for center, apex, scale, amp in [(74, 118, 0.055, 22), (171, 135, 0.040, 18)]:
+        for i in range(n_traces):
+            idx = int(apex + scale * (i - center) ** 2)
+            if 1 <= idx < n_samples - 1:
+                data[i, idx - 1:idx + 2] += amp * (0.7 + 0.3 * rng.random())
 
-def apply_gain(traces: np.ndarray, mode: str, strength: float) -> np.ndarray:
-    if mode == "None" or strength <= 0:
-        return traces.copy()
-    n_samples = traces.shape[1]
-    t = np.linspace(0.0, 1.0, n_samples)
-    if mode == "Linear":
-        gain = 1.0 + strength * t
-    else:
-        gain = np.exp(strength * t)
-    return traces * gain[np.newaxis, :]
+    attenuation = np.linspace(1.0, 0.48, n_samples)
+    data *= attenuation[np.newaxis, :]
 
-
-def normalize_traces(traces: np.ndarray) -> np.ndarray:
-    denom = np.max(np.abs(traces), axis=1, keepdims=True)
-    denom[denom == 0] = 1.0
-    return traces / denom
-
-
-def background_remove(traces: np.ndarray) -> np.ndarray:
-    return traces - np.mean(traces, axis=0, keepdims=True)
-
-
-def _normalize_score(score: np.ndarray) -> np.ndarray:
-    score = np.asarray(score, dtype=float)
-    score -= np.nanmin(score)
-    mx = np.nanmax(score)
-    if mx > 0:
-        score = score / mx
-    return score
-
-
-def reflector_score_map(data: np.ndarray) -> np.ndarray:
-    absd = np.abs(data)
-    coherent = gaussian_filter(absd, sigma=(4.0, 0.9))
-    local = gaussian_filter(absd, sigma=(1.2, 1.2))
-    broad = gaussian_filter(absd, sigma=(10.0, 4.0))
-    contrast = np.maximum(local - broad, 0.0)
-    score = 0.7 * coherent + 0.3 * contrast
-    return _normalize_score(score)
-
-
-def disturbance_map(data: np.ndarray) -> np.ndarray:
-    absd = np.abs(data)
-    local_energy = uniform_filter(absd, size=(9, 17), mode="nearest")
-    broad_energy = uniform_filter(absd, size=(31, 41), mode="nearest")
-    texture = np.maximum(local_energy - broad_energy, 0.0)
-
-    horiz = gaussian_filter(absd, sigma=(5.5, 1.1))
-    lateral_break = np.abs(np.gradient(horiz, axis=0))
-    vertical_break = np.abs(np.gradient(gaussian_filter(absd, sigma=(1.2, 3.5)), axis=1))
-
-    score = 0.45 * texture + 0.35 * gaussian_filter(lateral_break, sigma=(2.0, 1.2)) + 0.20 * gaussian_filter(vertical_break, sigma=(1.5, 1.5))
-    return _normalize_score(score)
-
-
-def hyperbola_score_map(data: np.ndarray, apex_half_width: int = 6) -> np.ndarray:
-    data_abs = np.abs(data)
-    smooth = gaussian_filter(data_abs, sigma=(1.0, 1.0))
-    local_max = maximum_filter(smooth, size=(3, apex_half_width * 2 + 1))
-    apex_mask = smooth >= local_max * 0.965
-    curved_support = np.zeros_like(smooth)
-    for w in [3, 5, 7, 9]:
-        up = np.roll(smooth, shift=w, axis=1)
-        left = np.roll(smooth, shift=-w, axis=0)
-        right = np.roll(smooth, shift=w, axis=0)
-        curved_support += np.minimum(up, (left + right) / 2.0)
-    score = (0.45 * smooth + 0.55 * curved_support) * apex_mask.astype(float)
-    score = gaussian_filter(score, sigma=(2.2, 1.2))
-    return _normalize_score(score)
-
-
-def candidate_table_from_scores(dist_score: np.ndarray, hyp_score: np.ndarray, refl_score: np.ndarray, time_axis: np.ndarray, distance_axis: np.ndarray, top_n: int = 12) -> pd.DataFrame:
-    maps = {
-        "possible hyperbolic target": hyp_score,
-        "possible disturbed zone": dist_score,
-        "possible strong reflector / target": refl_score,
+    metadata = {
+        "demo_mode": True,
+        "description": "Plain raw-style training line with banding, disturbed zones, and ambiguous anomalies.",
+        "n_traces": n_traces,
+        "samples_per_trace": n_samples,
+        "range_ns": float(t[-1]),
     }
-    rows = []
-    seen = []
-
-    def far_enough(tr, smp):
-        for tr0, smp0 in seen:
-            if abs(tr - tr0) <= 12 and abs(smp - smp0) <= 18:
-                return False
-        return True
-
-    for label, arr in maps.items():
-        local = maximum_filter(arr, size=(11, 21))
-        thresh = np.quantile(arr, 0.975 if label != "possible disturbed zone" else 0.982)
-        peaks = np.argwhere((arr >= local) & (arr >= thresh))
-        peak_rows = []
-        for tr, smp in peaks:
-            combined = 0.35 * refl_score[tr, smp] + 0.35 * hyp_score[tr, smp] + 0.30 * dist_score[tr, smp]
-            peak_rows.append((combined, tr, smp))
-        peak_rows.sort(reverse=True, key=lambda x: x[0])
-        for combined, tr, smp in peak_rows[: max(top_n, 8)]:
-            if not far_enough(tr, smp):
-                continue
-            seen.append((tr, smp))
-            rows.append({
-                "Trace Index": int(tr),
-                "Sample Index": int(smp),
-                "Distance": float(distance_axis[tr]),
-                "Time": float(time_axis[smp]),
-                "Disturbance Score": float(dist_score[tr, smp]),
-                "Hyperbola Score": float(hyp_score[tr, smp]),
-                "Reflector Score": float(refl_score[tr, smp]),
-                "Combined Score": float(combined),
-                "Likely Pattern": label,
-            })
-
-    if not rows:
-        return pd.DataFrame(columns=["Trace Index", "Sample Index", "Distance", "Time", "Disturbance Score", "Hyperbola Score", "Reflector Score", "Combined Score", "Likely Pattern"])
-
-    out = pd.DataFrame(rows).sort_values(["Combined Score", "Reflector Score", "Hyperbola Score"], ascending=False).head(top_n).reset_index(drop=True)
-    return out
+    return GPRData("demo", "plain_training_line.csv", data, t, x, metadata=metadata)
 
 
-def process_gpr(gpr_data: GPRData, controls: Dict[str, Any]) -> ProcessedGPR:
-    raw = np.asarray(gpr_data.traces, dtype=float)
+# -----------------------------
+# Processing
+# -----------------------------
+def process_radargram(raw: np.ndarray, settings: Dict[str, Any]) -> Tuple[np.ndarray, List[str]]:
+    arr = raw.astype(float).copy()
     notes: List[str] = []
-    distance_axis = gpr_data.distance_axis if gpr_data.distance_axis is not None and len(gpr_data.distance_axis) == raw.shape[0] else np.arange(raw.shape[0], dtype=float)
-    time_axis = gpr_data.time_axis if gpr_data.time_axis is not None and len(gpr_data.time_axis) == raw.shape[1] else np.arange(raw.shape[1], dtype=float)
 
-    tr0 = int(controls["trace_crop_min"])
-    tr1 = int(controls["trace_crop_max"])
-    sm0 = int(controls["sample_crop_min"])
-    sm1 = int(controls["sample_crop_max"])
-    raw = raw[tr0:tr1 + 1, sm0:sm1 + 1]
-    distance_axis = distance_axis[tr0:tr1 + 1]
-    time_axis = time_axis[sm0:sm1 + 1]
-    notes.append(f"Cropped traces to {tr0}-{tr1} and samples to {sm0}-{sm1}.")
+    # Crop first for speed and clarity
+    t0 = int(settings["trace_start"])
+    t1 = int(settings["trace_end"])
+    s0 = int(settings["sample_start"])
+    s1 = int(settings["sample_end"])
+    arr = arr[t0:t1, s0:s1]
+    notes.append(f"Cropped to traces {t0}:{t1} and samples {s0}:{s1}.")
 
-    proc = raw.copy()
-    tz = int(controls["time_zero_shift"])
-    if tz != 0:
-        proc = apply_time_zero_shift(proc, tz)
-        notes.append(f"Applied time-zero shift of {tz} samples.")
-    if controls["dewow_on"]:
-        proc = dewow(proc, int(controls["dewow_window"]))
-        notes.append(f"Applied dewow with window {int(controls['dewow_window'])}.")
-    if controls["background_remove"]:
-        proc = background_remove(proc)
+    # Time-zero shift
+    shift = int(settings["time_zero_shift"])
+    if shift != 0:
+        arr = np.roll(arr, -shift, axis=1)
+        notes.append(f"Applied time-zero shift of {shift} samples.")
+
+    if settings["dewow_on"]:
+        w = int(settings["dewow_window"])
+        arr = arr - running_mean_rows(arr, w)
+        notes.append(f"Applied dewow with window {w}.")
+
+    if settings["background_on"]:
+        background = np.mean(arr, axis=0, keepdims=True)
+        arr = arr - background
         notes.append("Applied background removal.")
-    proc = apply_gain(proc, controls["gain_mode"], float(controls["gain_strength"]))
-    if controls["gain_mode"] != "None" and float(controls["gain_strength"]) > 0:
-        notes.append(f"Applied {controls['gain_mode'].lower()} gain with strength {float(controls['gain_strength']):.2f}.")
-    if controls["trace_normalize"]:
-        proc = normalize_traces(proc)
+
+    gain_mode = settings["gain_mode"]
+    gain_strength = float(settings["gain_strength"])
+    if gain_mode != "None" and gain_strength > 0:
+        if gain_mode == "Linear":
+            g = linear_gain(arr.shape[1], gain_strength)
+        else:
+            g = exponential_gain(arr.shape[1], gain_strength)
+        arr = arr * g[np.newaxis, :]
+        notes.append(f"Applied {gain_mode.lower()} gain with strength {gain_strength:.2f}.")
+
+    if settings["normalize_traces"]:
+        arr = normalize_per_trace(arr)
         notes.append("Applied per-trace normalization.")
 
-    refl_score = reflector_score_map(proc)
-    dist_score = disturbance_map(proc)
-    hyp_score = hyperbola_score_map(proc)
-    candidates = candidate_table_from_scores(dist_score, hyp_score, refl_score, time_axis, distance_axis, top_n=int(controls["top_candidates"]))
-    if not candidates.empty:
-        notes.append(f"Flagged {len(candidates)} review targets from processed radargram scoring.")
+    if settings["light_smooth_on"]:
+        arr = gaussian_like_smooth_rows(arr, passes=int(settings["light_smooth_passes"]))
+        notes.append(f"Applied light smoothing ({int(settings['light_smooth_passes'])} passes).")
+
+    return arr, notes
+
+
+# -----------------------------
+# Candidate scoring
+# -----------------------------
+def local_vertical_variance(arr: np.ndarray) -> np.ndarray:
+    centered = arr - np.mean(arr, axis=1, keepdims=True)
+    return np.mean(centered**2, axis=1)
+
+
+def continuity_break_score(arr: np.ndarray) -> np.ndarray:
+    # Score traces where lateral change is high relative to neighbors.
+    if arr.shape[0] < 3:
+        return np.zeros(arr.shape[0])
+    diff_prev = np.abs(arr[1:-1] - arr[:-2])
+    diff_next = np.abs(arr[1:-1] - arr[2:])
+    core = np.mean(diff_prev + diff_next, axis=1)
+    out = np.zeros(arr.shape[0])
+    out[1:-1] = core
+    out[0] = out[1]
+    out[-1] = out[-2]
+    return out
+
+
+def hyperbola_like_score(arr: np.ndarray) -> Tuple[np.ndarray, pd.DataFrame]:
+    n_traces, n_samples = arr.shape
+    score_map = np.zeros_like(arr, dtype=float)
+    candidates = []
+
+    # Very simple apex finder: local maxima in absolute amplitude where neighboring traces dip slightly deeper.
+    abs_arr = np.abs(arr)
+    if n_traces < 7 or n_samples < 20:
+        return score_map, pd.DataFrame(columns=["Trace", "Sample", "Type", "Score", "Reason"])
+
+    max_amp = np.percentile(abs_arr, 98)
+    thresh = max(max_amp * 0.55, np.percentile(abs_arr, 92))
+
+    for i in range(3, n_traces - 3):
+        trace = abs_arr[i]
+        local_peaks = np.where((trace[1:-1] > trace[:-2]) & (trace[1:-1] >= trace[2:]) & (trace[1:-1] > thresh))[0] + 1
+        for j in local_peaks:
+            if j < 10 or j > n_samples - 15:
+                continue
+            center = abs_arr[i, j]
+            left_min = min(abs_arr[i - 1, min(j + 1, n_samples - 1)], abs_arr[i - 2, min(j + 2, n_samples - 1)])
+            right_min = min(abs_arr[i + 1, min(j + 1, n_samples - 1)], abs_arr[i + 2, min(j + 2, n_samples - 1)])
+            neighbor_energy = np.mean([
+                abs_arr[i - 1, j:j + 4].mean(),
+                abs_arr[i + 1, j:j + 4].mean(),
+                abs_arr[i - 2, j:j + 5].mean(),
+                abs_arr[i + 2, j:j + 5].mean(),
+            ])
+            score = max(0.0, center - 0.6 * (left_min + right_min) - 0.2 * neighbor_energy)
+            if score > np.percentile(abs_arr, 80):
+                score_map[max(0, i - 2):min(n_traces, i + 3), max(0, j - 2):min(n_samples, j + 6)] += score
+                candidates.append({
+                    "Trace": i,
+                    "Sample": j,
+                    "Type": "Possible hyperbolic target",
+                    "Score": round(float(score), 2),
+                    "Reason": "Local apex with deeper neighboring energy.",
+                })
+
+    cand_df = pd.DataFrame(candidates)
+    if not cand_df.empty:
+        cand_df = cand_df.sort_values("Score", ascending=False).drop_duplicates(subset=["Trace", "Sample"]).reset_index(drop=True)
     else:
-        notes.append("No strong automated review targets exceeded the current candidate threshold.")
-
-    return ProcessedGPR(raw=raw, processed=proc, time_axis=time_axis, distance_axis=distance_axis, notes=notes, disturbance_score=dist_score, hyperbola_score=hyp_score, reflector_score=refl_score, candidate_table=candidates)
-
-
-def make_radargram_figure(data: np.ndarray, time_axis: np.ndarray, distance_axis: np.ndarray, use_distance: bool, clip_low: float, clip_high: float, invert_y: bool, cmap: str, title: str, overlay_df: Optional[pd.DataFrame] = None):
-    x = distance_axis if use_distance and len(distance_axis) == data.shape[0] else np.arange(data.shape[0])
-    xlabel = "Distance" if use_distance and len(distance_axis) == data.shape[0] else "Trace Number"
-    y = time_axis if len(time_axis) == data.shape[0 if False else 1] else np.arange(data.shape[1])
-    ylabel = "Time (ns)" if len(time_axis) == data.shape[1] else "Sample"
-
-    vmin = np.percentile(data, clip_low)
-    vmax = np.percentile(data, clip_high)
-    extent = [x[0], x[-1], y[-1], y[0]] if invert_y else [x[0], x[-1], y[0], y[-1]]
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.imshow(data.T, aspect="auto", extent=extent, vmin=vmin, vmax=vmax, cmap=cmap)
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
-    ax.set_title(title)
-    if overlay_df is not None and not overlay_df.empty:
-        ox = overlay_df["Distance"].to_numpy() if xlabel == "Distance" else overlay_df["Trace Index"].to_numpy()
-        oy = overlay_df["Time"].to_numpy()
-        ax.scatter(ox, oy, s=40, facecolors="none", edgecolors="red", linewidths=1.5)
-    fig.tight_layout()
-    return fig
+        cand_df = pd.DataFrame(columns=["Trace", "Sample", "Type", "Score", "Reason"])
+    return score_map, cand_df
 
 
-def make_trace_figure(raw: np.ndarray, processed: np.ndarray, time_axis: np.ndarray, trace_index: int):
-    trace_index = max(0, min(trace_index, raw.shape[0] - 1))
-    y = time_axis if len(time_axis) == raw.shape[1] else np.arange(raw.shape[1])
-    fig, ax = plt.subplots(figsize=(7, 5))
-    ax.plot(raw[trace_index], y, label="Raw", alpha=0.8)
-    ax.plot(processed[trace_index], y, label="Processed", alpha=0.8)
-    ax.set_title(f"Trace {trace_index}")
-    ax.set_xlabel("Amplitude")
-    ax.set_ylabel("Time (ns)" if len(time_axis) == raw.shape[1] else "Sample")
-    ax.invert_yaxis()
-    ax.legend()
-    fig.tight_layout()
-    return fig
+def disturbance_candidates(arr: np.ndarray) -> Tuple[np.ndarray, pd.DataFrame]:
+    var_score = local_vertical_variance(arr)
+    cont_score = continuity_break_score(arr)
+    combo = 0.45 * (var_score / (np.max(var_score) + 1e-9)) + 0.55 * (cont_score / (np.max(cont_score) + 1e-9))
+
+    threshold = np.percentile(combo, 88)
+    flagged = combo >= threshold
+    rows = []
+    score_map = np.zeros_like(arr, dtype=float)
+
+    i = 0
+    while i < len(flagged):
+        if not flagged[i]:
+            i += 1
+            continue
+        start = i
+        while i < len(flagged) and flagged[i]:
+            i += 1
+        end = i
+        width = end - start
+        if width >= 3:
+            score = float(np.mean(combo[start:end]))
+            score_map[start:end, :] += score
+            rows.append({
+                "Trace": int((start + end) // 2),
+                "Sample": int(arr.shape[1] * 0.35),
+                "Type": "Possible disturbed zone",
+                "Score": round(score, 3),
+                "Reason": f"Elevated reflector disruption / variance across traces {start}-{end - 1}.",
+                "Trace Start": start,
+                "Trace End": end - 1,
+            })
+    df = pd.DataFrame(rows)
+    if df.empty:
+        df = pd.DataFrame(columns=["Trace", "Sample", "Type", "Score", "Reason", "Trace Start", "Trace End"])
+    return score_map, df
 
 
-def traces_to_csv_bytes(traces: np.ndarray) -> bytes:
-    return pd.DataFrame(traces).to_csv(index=False).encode("utf-8")
+def build_candidate_table(processed: np.ndarray) -> Tuple[np.ndarray, np.ndarray, pd.DataFrame]:
+    dist_map, dist_df = disturbance_candidates(processed)
+    hyp_map, hyp_df = hyperbola_like_score(processed)
+    frames = []
+    if not dist_df.empty:
+        frames.append(dist_df)
+    if not hyp_df.empty:
+        frames.append(hyp_df)
+    combined = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=["Trace", "Sample", "Type", "Score", "Reason"])
+    if not combined.empty:
+        combined = combined.sort_values("Score", ascending=False).reset_index(drop=True)
+    return dist_map, hyp_map, combined
 
 
-def ollama_available(base_url: str = "http://127.0.0.1:11434") -> bool:
+# -----------------------------
+# AI guidance
+# -----------------------------
+def ollama_available(base_url: str) -> bool:
     try:
-        resp = requests.get(f"{base_url.rstrip('/')}/api/tags", timeout=1.5)
-        return resp.ok
+        r = requests.get(f"{base_url.rstrip('/')}/api/tags", timeout=1.2)
+        return r.ok
     except Exception:
         return False
 
 
-def call_ollama(prompt: str, model: str, base_url: str = "http://127.0.0.1:11434") -> str:
-    payload = {"model": model, "prompt": prompt, "stream": False, "options": {"temperature": 0.2}}
-    resp = requests.post(f"{base_url.rstrip('/')}/api/generate", json=payload, timeout=120)
-    resp.raise_for_status()
-    return str(resp.json().get("response", "")).strip()
+def call_ollama(prompt: str, model: str, base_url: str) -> str:
+    r = requests.post(
+        f"{base_url.rstrip('/')}/api/generate",
+        json={"model": model, "prompt": prompt, "stream": False, "options": {"temperature": 0.2}},
+        timeout=90,
+    )
+    r.raise_for_status()
+    return str(r.json().get("response", "")).strip()
 
 
 def openai_available() -> bool:
-    try:
-        key = st.secrets.get("OPENAI_API_KEY", "")
-    except Exception:
-        key = ""
-    return bool(os.getenv("OPENAI_API_KEY") or key)
+    return bool(safe_get_secret("OPENAI_API_KEY", ""))
 
 
 def call_openai(prompt: str, model: str = "gpt-4.1-mini") -> str:
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        try:
-            api_key = st.secrets.get("OPENAI_API_KEY", "")
-        except Exception:
-            api_key = ""
+    api_key = safe_get_secret("OPENAI_API_KEY", "")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY not configured.")
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": "You are a careful geophysical assistant. Use only the supplied radargram context. Be concise and do not claim graves or definitive objects."},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.2,
-    }
-    resp = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload, timeout=120)
-    resp.raise_for_status()
-    return str(resp.json()["choices"][0]["message"]["content"]).strip()
-
-
-def build_ai_context(project: RadanProject, processed: ProcessedGPR) -> str:
-    lines = [
-        f"Source file: {project.dzt.source_file if project.dzt else project.stem}",
-        f"Trace count: {processed.processed.shape[0]}",
-        f"Samples per trace: {processed.processed.shape[1]}",
-        f"Top candidate count: {len(processed.candidate_table)}",
-    ]
-    if not processed.candidate_table.empty:
-        sample = processed.candidate_table.head(8)
-        lines.append("Top review targets:")
-        for _, row in sample.iterrows():
-            lines.append(
-                f"- trace {int(row['Trace Index'])}, time {row['Time']:.2f}, combined {row['Combined Score']:.2f}, pattern {row['Likely Pattern']}"
-            )
-    lines.append("Processing notes: " + "; ".join(processed.notes))
-    return "\n".join(lines)
-
-
-def generate_ai_summary(project: RadanProject, processed: ProcessedGPR, question: str, prefer_local: bool, ollama_model: str, ollama_base_url: str, openai_model: str) -> Tuple[str, str]:
-    prompt = (
-        "Use the following GPR processing context to answer the user. "
-        "Treat all outputs as review targets, not confirmed graves or confirmed buried objects. "
-        "Be concise and mention uncertainty.\n\n"
-        + build_ai_context(project, processed)
-        + "\n\nUser request: " + question
+    r = requests.post(
+        "https://api.openai.com/v1/chat/completions",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={
+            "model": model,
+            "messages": [
+                {"role": "system", "content": "You are a careful GPR teaching assistant. Do not claim graves or definitive object identities. Use cautious language and explain uncertainty."},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.2,
+        },
+        timeout=90,
     )
-    if prefer_local and ollama_available(ollama_base_url):
+    r.raise_for_status()
+    return str(r.json()["choices"][0]["message"]["content"]).strip()
+
+
+def generate_guidance(project: RadanProject, notes: List[str], candidates: pd.DataFrame, prefer_local: bool, ollama_model: str, ollama_url: str, openai_model: str) -> Tuple[str, str]:
+    primary = project.dzt or project.dzg or project.dzx or project.dza
+    meta = primary.metadata if primary else {}
+    top_rows = candidates.head(8).to_dict(orient="records") if candidates is not None and not candidates.empty else []
+    prompt = (
+        "Review this GPR teaching-assistant context and produce a concise interpretation guide for students. "
+        "Do not claim graves or certainty. Explain what to review, what alternative explanations exist, and what processing choices might matter.\n\n"
+        f"Project: {project.stem}\n"
+        f"Metadata: {meta}\n"
+        f"Processing notes: {'; '.join(notes)}\n"
+        f"Top candidate rows: {top_rows}\n"
+    )
+    if prefer_local and ollama_available(ollama_url):
         try:
-            return call_ollama(prompt, ollama_model, ollama_base_url), f"Ollama ({ollama_model})"
+            return call_ollama(prompt, ollama_model, ollama_url), f"Ollama ({ollama_model})"
         except Exception:
             pass
     if openai_available():
@@ -590,91 +584,128 @@ def generate_ai_summary(project: RadanProject, processed: ProcessedGPR, question
             return call_openai(prompt, openai_model), f"OpenAI ({openai_model})"
         except Exception:
             pass
-    if (not prefer_local) and ollama_available(ollama_base_url):
-        try:
-            return call_ollama(prompt, ollama_model, ollama_base_url), f"Ollama ({ollama_model})"
-        except Exception:
-            pass
-    raise RuntimeError("No AI provider available. Core GPR analysis still works without AI.")
+    raise RuntimeError("No AI provider available. Core interpretation workflow still works without AI.")
 
 
+# -----------------------------
+# Plotting
+# -----------------------------
+def plot_radargram(gpr_data: GPRData, data: np.ndarray, title: str, use_distance: bool, invert_y: bool,
+                   clip_low: float, clip_high: float, cmap: str,
+                   trace_start: int, trace_end: int, sample_start: int, sample_end: int,
+                   candidate_df: Optional[pd.DataFrame] = None, show_overlay: bool = False):
+    extent, xlabel, ylabel = axis_extent(gpr_data, invert_y, trace_start, trace_end, sample_start, sample_end, use_distance)
+    vmin, vmax = robust_clip_limits(data, clip_low, clip_high)
+
+    fig, ax = plt.subplots(figsize=(11, 6))
+    ax.imshow(data.T, aspect="auto", extent=extent, vmin=vmin, vmax=vmax, cmap=cmap)
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+
+    if show_overlay and candidate_df is not None and not candidate_df.empty:
+        for _, row in candidate_df.head(20).iterrows():
+            tr = int(row.get("Trace", 0))
+            smp = int(row.get("Sample", 0))
+            typ = str(row.get("Type", "Candidate"))
+            if "disturbed" in typ.lower():
+                start = int(row.get("Trace Start", max(tr - 2, 0)))
+                end = int(row.get("Trace End", min(tr + 2, data.shape[0] - 1)))
+                x0 = start if not (use_distance and gpr_data.distance_axis is not None) else gpr_data.distance_axis[min(trace_start + start, len(gpr_data.distance_axis)-1)]
+                x1 = end if not (use_distance and gpr_data.distance_axis is not None) else gpr_data.distance_axis[min(trace_start + end, len(gpr_data.distance_axis)-1)]
+                y0 = extent[2] if invert_y else extent[2]
+                height = abs(extent[3] - extent[2])
+                rect = Rectangle((x0, min(extent[2], extent[3])), max(x1 - x0, 0.2), height,
+                                 fill=False, edgecolor="deepskyblue", linewidth=1.3, linestyle="--")
+                ax.add_patch(rect)
+            else:
+                x = tr if not (use_distance and gpr_data.distance_axis is not None) else gpr_data.distance_axis[min(trace_start + tr, len(gpr_data.distance_axis)-1)]
+                y = smp if gpr_data.time_axis is None else gpr_data.time_axis[min(sample_start + smp, len(gpr_data.time_axis)-1)]
+                ax.scatter([x], [y], c="yellow", s=42, edgecolors="black", linewidths=0.5)
+    fig.tight_layout()
+    return fig
+
+
+def plot_trace(raw_trace: np.ndarray, proc_trace: np.ndarray, time_axis: np.ndarray, trace_idx: int):
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.plot(raw_trace, time_axis, label="Raw", alpha=0.7)
+    ax.plot(proc_trace, time_axis, label="Processed", linewidth=1.2)
+    ax.set_title(f"Trace {trace_idx}: Raw vs Processed")
+    ax.set_xlabel("Amplitude")
+    ax.set_ylabel("Time / Sample")
+    ax.invert_yaxis()
+    ax.legend()
+    fig.tight_layout()
+    return fig
+
+
+# -----------------------------
+# App
+# -----------------------------
 def init_page():
-    st.set_page_config(page_title="GPR Control Panel", layout="wide")
-    st.title("GPR Control Panel")
-    st.caption("Raw-file-first GPR review tool for grouped RADAN project files. Candidate finding is assistive only, not definitive interpretation.")
+    st.set_page_config(page_title="GPR Teaching Assistant", layout="wide")
+    st.title("GPR Teaching Assistant")
+    st.caption("Raw-first workflow for loading, processing, reviewing, and teaching GPR interpretation.")
 
 
-def render_sidebar(project: Optional[RadanProject] = None) -> Dict[str, Any]:
-    st.sidebar.header("Display Controls")
-    n_traces = int(project.dzt.traces.shape[0]) if project and project.dzt and project.dzt.traces is not None else 200
-    n_samples = int(project.dzt.traces.shape[1]) if project and project.dzt and project.dzt.traces is not None else 256
+def sidebar_controls(n_traces: int, n_samples: int) -> Dict[str, Any]:
+    st.sidebar.header("Display")
+    clip_low = st.sidebar.slider("Lower contrast clip percentile", 0.0, 20.0, 2.0, 0.5)
+    clip_high = st.sidebar.slider("Upper contrast clip percentile", 80.0, 100.0, 98.0, 0.5)
+    cmap = st.sidebar.selectbox("Colormap", ["gray", "seismic", "viridis", "plasma"], index=0)
+    use_distance = st.sidebar.checkbox("Use distance axis if available", value=True)
+    invert_y = st.sidebar.checkbox("Invert vertical axis", value=True)
 
-    controls = {
-        "clip_low": st.sidebar.slider("Lower contrast clip percentile", 0.0, 20.0, 2.0, 0.5),
-        "clip_high": st.sidebar.slider("Upper contrast clip percentile", 80.0, 100.0, 98.0, 0.5),
-        "use_distance": st.sidebar.checkbox("Use distance axis if available", value=True),
-        "invert_y": st.sidebar.checkbox("Invert vertical axis", value=True),
-        "cmap": st.sidebar.selectbox("Colormap", ["gray", "seismic", "viridis", "plasma"], index=0),
-        "time_zero_shift": st.sidebar.slider("Time-zero shift (samples)", -40, 40, 0, 1),
-        "dewow_on": st.sidebar.checkbox("Dewow", value=True),
-        "dewow_window": st.sidebar.slider("Dewow window", 3, 81, 21, 2),
-        "background_remove": st.sidebar.checkbox("Background removal", value=True),
-        "trace_normalize": st.sidebar.checkbox("Per-trace normalization", value=False),
-        "gain_mode": st.sidebar.selectbox("Gain mode", ["None", "Linear", "Exponential"], index=1),
-        "gain_strength": st.sidebar.slider("Gain strength", 0.0, 8.0, 2.0, 0.1),
-        "trace_crop_min": st.sidebar.slider("Trace crop start", 0, max(0, n_traces - 1), 0, 1),
-        "trace_crop_max": st.sidebar.slider("Trace crop end", 0, max(0, n_traces - 1), max(0, n_traces - 1), 1),
-        "sample_crop_min": st.sidebar.slider("Sample crop start", 0, max(0, n_samples - 1), 0, 1),
-        "sample_crop_max": st.sidebar.slider("Sample crop end", 0, max(0, n_samples - 1), max(0, n_samples - 1), 1),
-        "top_candidates": st.sidebar.slider("Top review targets", 3, 25, 10, 1),
-        "ai_enable": st.sidebar.checkbox("Enable optional AI interpretation", value=False),
-        "ai_prefer_local": st.sidebar.checkbox("Prefer Ollama", value=True),
-        "ollama_model": st.sidebar.text_input("Ollama model", value="llama3.1:8b"),
-        "ollama_base_url": st.sidebar.text_input("Ollama URL", value="http://127.0.0.1:11434"),
-        "openai_model": st.sidebar.text_input("OpenAI model", value="gpt-4.1-mini"),
+    st.sidebar.header("Crop")
+    trace_range = st.sidebar.slider("Trace range", 0, max(1, n_traces), (0, max(1, n_traces)))
+    sample_range = st.sidebar.slider("Sample range", 0, max(1, n_samples), (0, max(1, n_samples)))
+
+    st.sidebar.header("Processing")
+    time_zero_shift = st.sidebar.slider("Time-zero shift (samples)", -20, 20, 0)
+    dewow_on = st.sidebar.checkbox("Dewow", value=True)
+    dewow_window = st.sidebar.slider("Dewow window", 3, 101, 21, step=2)
+    background_on = st.sidebar.checkbox("Background removal", value=True)
+    gain_mode = st.sidebar.selectbox("Gain mode", ["None", "Linear", "Exponential"], index=1)
+    gain_strength = st.sidebar.slider("Gain strength", 0.0, 5.0, 1.2, 0.1)
+    normalize_traces = st.sidebar.checkbox("Per-trace normalization", value=False)
+    light_smooth_on = st.sidebar.checkbox("Light smoothing", value=False)
+    light_smooth_passes = st.sidebar.slider("Smoothing passes", 1, 4, 2)
+
+    st.sidebar.header("AI Guidance")
+    ai_enable = st.sidebar.checkbox("Enable optional AI guidance", value=False)
+    prefer_local = st.sidebar.checkbox("Prefer local Ollama", value=True)
+    ollama_model = st.sidebar.text_input("Ollama model", value="llama3.1:8b")
+    ollama_url = st.sidebar.text_input("Ollama URL", value="http://127.0.0.1:11434")
+    openai_model = st.sidebar.text_input("OpenAI model", value="gpt-4.1-mini")
+
+    return {
+        "clip_low": clip_low,
+        "clip_high": clip_high,
+        "cmap": cmap,
+        "use_distance": use_distance,
+        "invert_y": invert_y,
+        "trace_start": trace_range[0],
+        "trace_end": trace_range[1],
+        "sample_start": sample_range[0],
+        "sample_end": sample_range[1],
+        "time_zero_shift": time_zero_shift,
+        "dewow_on": dewow_on,
+        "dewow_window": dewow_window,
+        "background_on": background_on,
+        "gain_mode": gain_mode,
+        "gain_strength": gain_strength,
+        "normalize_traces": normalize_traces,
+        "light_smooth_on": light_smooth_on,
+        "light_smooth_passes": light_smooth_passes,
+        "ai_enable": ai_enable,
+        "prefer_local": prefer_local,
+        "ollama_model": ollama_model,
+        "ollama_url": ollama_url,
+        "openai_model": openai_model,
     }
-    if controls["trace_crop_max"] < controls["trace_crop_min"]:
-        controls["trace_crop_max"] = controls["trace_crop_min"]
-    if controls["sample_crop_max"] < controls["sample_crop_min"]:
-        controls["sample_crop_max"] = controls["sample_crop_min"]
-    return controls
 
 
-def render_file_loader():
-    st.subheader("1. Load RADAN Project Files")
-    uploaded = st.file_uploader(
-        "Upload one or more related files",
-        type=["dzt", "csv", "txt", "asc", "dzg", "dzx", "dza"],
-        accept_multiple_files=True,
-        help="Upload matching files like line01.dzt, line01.dzg, line01.dzx, and line01.dza together.",
-    )
-    return uploaded
-
-
-def render_project_inventory(projects: Dict[str, RadanProject]) -> str:
-    st.subheader("2. Project Inventory")
-    rows = []
-    for stem in sorted(projects.keys()):
-        p = projects[stem]
-        rows.append({"Project": stem, "DZT": "✓" if p.dzt else "✗", "DZG": "✓" if p.dzg else "✗", "DZX": "✓" if p.dzx else "✗", "DZA": "✓" if p.dza else "✗", "Other files": len(p.other_files)})
-    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
-    return st.selectbox("Choose project", sorted(projects.keys()))
-
-
-def render_metadata(gpr_data: GPRData):
-    st.subheader("Metadata")
-    st.write(f"**File type:** {gpr_data.file_type}")
-    st.write(f"**Source file:** {gpr_data.source_file}")
-    if gpr_data.traces is not None:
-        st.write(f"**Trace matrix shape:** {gpr_data.traces.shape}")
-    if gpr_data.gps is not None:
-        st.json(gpr_data.gps)
-    if gpr_data.metadata:
-        st.dataframe(pd.DataFrame([{"Field": k, "Value": str(v)} for k, v in gpr_data.metadata.items()]), width="stretch", hide_index=True)
-
-
-def render_companion_panels(project: RadanProject):
-    st.subheader("Companion Files")
+def render_companions(project: RadanProject):
     c1, c2, c3 = st.columns(3)
     with c1:
         st.write("**DZG**")
@@ -687,158 +718,183 @@ def render_companion_panels(project: RadanProject):
         st.json(project.dza.metadata) if project.dza is not None else st.write("No DZA loaded")
 
     if project.other_files:
-        rows = []
-        for name, inspection in project.other_files.items():
-            rows.append({"File": name, "Type guess": inspection.likely_type, "Binary": inspection.is_binary, "Size": inspection.size_bytes, "Notes": inspection.notes})
+        rows = [{"File": name, "Type guess": v.likely_type, "Size": v.size_bytes, "Notes": v.notes} for name, v in project.other_files.items()]
         st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+
+def export_report(project: RadanProject, notes: List[str], candidates: pd.DataFrame) -> bytes:
+    primary = project.dzt or project.dzg or project.dzx or project.dza
+    lines = [
+        f"Project: {project.stem}",
+        f"Primary source: {primary.source_file if primary else 'None'}",
+        "",
+        "Metadata:",
+    ]
+    if primary is not None:
+        for k, v in primary.metadata.items():
+            lines.append(f"- {k}: {v}")
+    lines.extend(["", "Processing notes:"])
+    for n in notes:
+        lines.append(f"- {n}")
+    lines.extend(["", "Candidate review table:"])
+    if candidates is not None and not candidates.empty:
+        lines.append(candidates.head(20).to_csv(index=False))
+    else:
+        lines.append("No candidates flagged.")
+    return "\n".join(lines).encode("utf-8")
 
 
 def main():
     init_page()
-    uploaded_files = render_file_loader()
-    if not uploaded_files:
-        st.info("Upload one or more related files to begin.")
-        st.stop()
 
-    projects = build_projects_from_uploads(uploaded_files)
+    st.subheader("1. Load Raw Project Files")
+    demo_mode = st.selectbox("Demo mode", ["None", "Plain training line"], index=0)
+    uploaded = st.file_uploader(
+        "Upload one or more related raw files",
+        type=["dzt", "csv", "txt", "asc", "dzg", "dzx", "dza"],
+        accept_multiple_files=True,
+        help="Upload raw radargram files and any companion files together.",
+    )
+
+    projects: Dict[str, RadanProject] = {}
+    if demo_mode == "Plain training line":
+        rp = RadanProject(stem="plain_training_line")
+        rp.dzt = build_plain_training_line()
+        projects[rp.stem] = rp
+    if uploaded:
+        projects.update(build_projects_from_uploads(uploaded))
+
     if not projects:
-        st.warning("No readable projects were assembled.")
+        st.info("Upload raw files or choose the plain training line demo.")
         st.stop()
 
-    selected_stem = render_project_inventory(projects)
+    st.subheader("2. Project Inventory")
+    rows = []
+    for stem, p in sorted(projects.items()):
+        primary = p.dzt or p.dzg or p.dzx or p.dza
+        rows.append({
+            "Project": stem,
+            "Primary": primary.file_type if primary else "None",
+            "Source": primary.source_file if primary else "None",
+            "DZT/Matrix": "✓" if p.dzt is not None else "✗",
+            "DZG": "✓" if p.dzg is not None else "✗",
+            "DZX": "✓" if p.dzx is not None else "✗",
+            "DZA": "✓" if p.dza is not None else "✗",
+            "Other files": len(p.other_files),
+        })
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+    selected_stem = st.selectbox("Choose project", list(sorted(projects.keys())))
     project = projects[selected_stem]
     primary = project.dzt or project.dzg or project.dzx or project.dza
-    if primary is None:
-        st.warning("This project has no primary readable RADAN file yet.")
-        render_companion_panels(project)
+    if primary is None or primary.traces is None:
+        st.warning("This project has no readable trace matrix yet.")
+        render_companions(project)
         st.stop()
 
-    controls = render_sidebar(project)
-    render_metadata(primary)
+    n_traces, n_samples = primary.traces.shape
+    controls = sidebar_controls(n_traces, n_samples)
 
-    if project.dzt is None:
-        st.info("No DZT file loaded for this project, so there is no radargram to process yet.")
-        render_companion_panels(project)
-        st.stop()
+    processed, notes = process_radargram(primary.traces, controls)
+    dist_map, hyp_map, candidate_df = build_candidate_table(processed)
+    proc_time = primary.time_axis[controls["sample_start"]:controls["sample_end"]] if primary.time_axis is not None else np.arange(processed.shape[1])
 
-    processed = process_gpr(project.dzt, controls)
-
-    tabs = st.tabs(["Load / Inventory", "Radargram", "Processed Radargram", "Single Trace", "Companions", "Interpret", "Report / Export"])
+    tabs = st.tabs(["Raw", "Processed", "Overlay / Review", "Single Trace", "Companions", "Interpret", "Report / Export"])
 
     with tabs[0]:
-        st.markdown("### Current project")
-        render_metadata(project.dzt)
-        st.markdown("### Project files")
-        inv = {
-            "DZT": project.files.get("dzt", "—"),
-            "DZG": project.files.get("dzg", "—"),
-            "DZX": project.files.get("dzx", "—"),
-            "DZA": project.files.get("dza", "—"),
-        }
-        st.dataframe(pd.DataFrame([inv]), width="stretch", hide_index=True)
-        st.markdown("### Processing preview")
-        for msg in processed.notes:
-            st.write(f"- {msg}")
+        st.markdown("### Raw radargram")
+        st.caption("This is the baseline image. Interpretation should begin here before relying on overlays.")
+        raw_crop = primary.traces[controls["trace_start"]:controls["trace_end"], controls["sample_start"]:controls["sample_end"]]
+        fig = plot_radargram(primary, raw_crop, f"Raw Radargram: {primary.source_file}", controls["use_distance"], controls["invert_y"],
+                             controls["clip_low"], controls["clip_high"], controls["cmap"],
+                             controls["trace_start"], controls["trace_end"], controls["sample_start"], controls["sample_end"])
+        st.pyplot(fig, clear_figure=True, width="stretch")
+        meta_rows = [{"Field": k, "Value": str(v)} for k, v in primary.metadata.items()]
+        st.dataframe(pd.DataFrame(meta_rows), width="stretch", hide_index=True)
 
     with tabs[1]:
-        st.markdown("### Raw radargram")
-        fig = make_radargram_figure(processed.raw, processed.time_axis, processed.distance_axis, controls["use_distance"], controls["clip_low"], controls["clip_high"], controls["invert_y"], controls["cmap"], f"Raw radargram: {project.dzt.source_file}", processed.candidate_table)
-        st.pyplot(fig, clear_figure=True, use_container_width=True)
-        if not processed.candidate_table.empty:
-            st.caption("Red circles mark automated review targets derived from the processed data, projected back onto the raw view.")
+        st.markdown("### Processed radargram")
+        st.caption("The processed image is derived from the raw data using the chosen steps in the sidebar.")
+        fig = plot_radargram(primary, processed, "Processed Radargram", controls["use_distance"], controls["invert_y"],
+                             controls["clip_low"], controls["clip_high"], controls["cmap"],
+                             controls["trace_start"], controls["trace_end"], controls["sample_start"], controls["sample_end"])
+        st.pyplot(fig, clear_figure=True, width="stretch")
+        for n in notes:
+            st.write(f"- {n}")
 
     with tabs[2]:
-        st.markdown("### Processed radargram")
-        fig = make_radargram_figure(processed.processed, processed.time_axis, processed.distance_axis, controls["use_distance"], controls["clip_low"], controls["clip_high"], controls["invert_y"], controls["cmap"], "Processed radargram with review targets", processed.candidate_table)
-        st.pyplot(fig, clear_figure=True, use_container_width=True)
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("**Disturbance score map**")
-            fig2 = make_radargram_figure(processed.disturbance_score, processed.time_axis, processed.distance_axis, controls["use_distance"], 0.0, 100.0, controls["invert_y"], "viridis", "Possible disturbed zones", processed.candidate_table)
-            st.pyplot(fig2, clear_figure=True, use_container_width=True)
-        with c2:
-            st.markdown("**Hyperbola score map**")
-            fig3 = make_radargram_figure(processed.hyperbola_score, processed.time_axis, processed.distance_axis, controls["use_distance"], 0.0, 100.0, controls["invert_y"], "plasma", "Possible hyperbolic targets", processed.candidate_table)
-            st.pyplot(fig3, clear_figure=True, use_container_width=True)
+        st.markdown("### Candidate overlays on raw and processed data")
+        left, right = st.columns(2)
+        raw_crop = primary.traces[controls["trace_start"]:controls["trace_end"], controls["sample_start"]:controls["sample_end"]]
+        with left:
+            fig = plot_radargram(primary, raw_crop, "Raw with Candidate Overlays", controls["use_distance"], controls["invert_y"],
+                                 controls["clip_low"], controls["clip_high"], controls["cmap"],
+                                 controls["trace_start"], controls["trace_end"], controls["sample_start"], controls["sample_end"],
+                                 candidate_df=candidate_df, show_overlay=True)
+            st.pyplot(fig, clear_figure=True, width="stretch")
+        with right:
+            fig = plot_radargram(primary, processed, "Processed with Candidate Overlays", controls["use_distance"], controls["invert_y"],
+                                 controls["clip_low"], controls["clip_high"], controls["cmap"],
+                                 controls["trace_start"], controls["trace_end"], controls["sample_start"], controls["sample_end"],
+                                 candidate_df=candidate_df, show_overlay=True)
+            st.pyplot(fig, clear_figure=True, width="stretch")
+
+        st.markdown("### Candidate review table")
+        if candidate_df.empty:
+            st.info("No strong candidate regions were flagged with the current processing settings.")
+        else:
+            review_df = candidate_df.copy()
+            review_df["Student Review"] = ""
+            review_df["Instructor Note"] = ""
+            st.dataframe(review_df.head(30), width="stretch", hide_index=True)
 
     with tabs[3]:
-        st.markdown("### Raw vs processed single trace")
-        trace_index = st.slider("Trace index", 0, max(0, processed.raw.shape[0] - 1), 0)
-        fig = make_trace_figure(processed.raw, processed.processed, processed.time_axis, trace_index)
-        st.pyplot(fig, clear_figure=True)
-        if not processed.candidate_table.empty:
-            nearby = processed.candidate_table.iloc[(processed.candidate_table["Trace Index"] - trace_index).abs().argsort()].head(5)
-            st.markdown("**Nearby review targets**")
-            st.dataframe(nearby, width="stretch", hide_index=True)
+        st.markdown("### Single trace: raw vs processed")
+        tr = st.slider("Trace index within cropped range", 0, max(0, processed.shape[0] - 1), 0)
+        raw_trace = primary.traces[controls["trace_start"] + tr, controls["sample_start"]:controls["sample_end"]]
+        proc_trace = processed[tr, :]
+        fig = plot_trace(raw_trace, proc_trace, proc_time, controls["trace_start"] + tr)
+        st.pyplot(fig, clear_figure=True, width="content")
 
     with tabs[4]:
-        render_companion_panels(project)
+        st.markdown("### Companion files")
+        render_companions(project)
 
     with tabs[5]:
-        st.markdown("### Candidate review")
-        st.info("These outputs are review targets from the processed radargram. They are not confirmed graves or confirmed buried objects.")
-        if processed.candidate_table.empty:
-            st.warning("No strong review targets exceeded the current scoring threshold.")
+        st.markdown("### Guided interpretation")
+        st.write("Use the candidate table as a review aid, not as proof of any specific subsurface target.")
+        if candidate_df.empty:
+            st.write("- No strong candidate regions were flagged. Try different processing settings and compare raw versus processed views.")
         else:
-            st.dataframe(processed.candidate_table, width="stretch", hide_index=True)
-        st.markdown("### Interpretation notes")
-        st.write("- Disturbance score emphasizes local texture change, reflector disruption, and unusual energy patterns.")
-        st.write("- Hyperbola score emphasizes local apex-like bright zones with curved support beneath them.")
-        st.write("- A strong score means 'review here', not 'grave detected'.")
+            top = candidate_df.head(8)
+            st.write("Common questions to ask:")
+            st.write("- Does this feature persist after processing, or is it created by the processing itself?")
+            st.write("- Is the anomaly a local apex, a disturbed vertical zone, a broken reflector, or just clutter?")
+            st.write("- What alternative explanations exist: roots, stones, surface effects, antenna coupling, uneven gain, banding?")
+            st.dataframe(top[[c for c in ["Type", "Trace", "Sample", "Score", "Reason"] if c in top.columns]], width="stretch", hide_index=True)
 
-        st.markdown("---")
-        st.markdown("### Optional AI assistant")
-        if not controls["ai_enable"]:
-            st.caption("AI is off. Core analysis remains fully available without it.")
-        else:
-            provider_bits = []
-            if ollama_available(controls["ollama_base_url"]):
-                provider_bits.append(f"Ollama ready at {controls['ollama_base_url']}")
-            if openai_available():
-                provider_bits.append("OpenAI key detected")
-            st.caption(" | ".join(provider_bits) if provider_bits else "No AI backend detected right now. The app still works without AI.")
-            question = st.text_area("AI request", value="Give me a concise interpretation of the strongest review targets and what a student should inspect next.")
-            if st.button("Generate AI summary", width="stretch"):
+        if controls["ai_enable"]:
+            if st.button("Generate optional AI guidance", width="stretch"):
                 try:
-                    text, provider = generate_ai_summary(project, processed, question, controls["ai_prefer_local"], controls["ollama_model"], controls["ollama_base_url"], controls["openai_model"])
-                    st.success(f"Provider used: {provider}")
-                    st.write(text)
-                    st.session_state["gpr_ai_text"] = text
+                    guidance, provider = generate_guidance(project, notes, candidate_df, controls["prefer_local"], controls["ollama_model"], controls["ollama_url"], controls["openai_model"])
+                    st.success(f"Guidance generated with {provider}")
+                    st.write(guidance)
+                    st.session_state["gpr_ai_guidance"] = guidance
                     st.session_state["gpr_ai_provider"] = provider
                 except Exception as e:
                     st.warning(str(e))
+        elif st.session_state.get("gpr_ai_guidance"):
+            st.write(st.session_state["gpr_ai_guidance"])
 
     with tabs[6]:
-        st.markdown("### Report")
-        lines = [
-            "GPR Control Panel Report",
-            f"Project: {project.stem}",
-            f"Source file: {project.dzt.source_file}",
-            f"Trace count: {processed.processed.shape[0]}",
-            f"Samples per trace: {processed.processed.shape[1]}",
-            "",
-            "Processing notes:",
-            *[f"- {n}" for n in processed.notes],
-            "",
-            f"Candidate count: {len(processed.candidate_table)}",
-        ]
-        if not processed.candidate_table.empty:
-            lines.append("")
-            lines.append("Top review targets:")
-            for _, row in processed.candidate_table.head(10).iterrows():
-                lines.append(f"- trace {int(row['Trace Index'])}, time {row['Time']:.2f}, combined {row['Combined Score']:.2f}, {row['Likely Pattern']}")
-        ai_text = st.session_state.get("gpr_ai_text", "")
-        if ai_text:
-            lines.extend(["", "Optional AI summary:", ai_text])
-        report_text = "\n".join(lines)
-        st.text_area("Report preview", report_text, height=320)
+        st.markdown("### Report and exports")
         c1, c2, c3 = st.columns(3)
         with c1:
-            st.download_button("Download raw trace matrix as CSV", data=traces_to_csv_bytes(processed.raw), file_name=f"{Path(project.dzt.source_file).stem}_raw_traces.csv", mime="text/csv", width="stretch")
+            st.download_button("Download raw matrix as CSV", pd.DataFrame(primary.traces).to_csv(index=False).encode("utf-8"), f"{project.stem}_raw.csv", "text/csv", width="stretch")
         with c2:
-            st.download_button("Download processed trace matrix as CSV", data=traces_to_csv_bytes(processed.processed), file_name=f"{Path(project.dzt.source_file).stem}_processed_traces.csv", mime="text/csv", width="stretch")
+            st.download_button("Download processed matrix as CSV", pd.DataFrame(processed).to_csv(index=False).encode("utf-8"), f"{project.stem}_processed.csv", "text/csv", width="stretch")
         with c3:
-            st.download_button("Download report as TXT", data=report_text.encode("utf-8"), file_name=f"{Path(project.dzt.source_file).stem}_report.txt", mime="text/plain", width="stretch")
+            st.download_button("Download report as TXT", export_report(project, notes, candidate_df), f"{project.stem}_report.txt", "text/plain", width="stretch")
 
 
 if __name__ == "__main__":
