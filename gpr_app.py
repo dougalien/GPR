@@ -286,70 +286,114 @@ def build_synthetic_demo_gpr() -> GPRData:
 
 
 def build_graveyard_demo_gpr() -> GPRData:
-    n_traces = 240
-    n_samples = 360
-    distance = np.linspace(0, 24, n_traces)
-    time_ns = np.linspace(0, 140, n_samples)
-    traces = np.random.normal(0, 8, size=(n_traces, n_samples))
+    rng = np.random.default_rng(14)
+    n_traces = 260
+    n_samples = 380
+    distance = np.linspace(0, 26, n_traces)
+    time_ns = np.linspace(0, 150, n_samples)
 
-    # direct wave / ground surface
+    # Base field-like texture: banded, cluttered, and a little messy.
+    traces = rng.normal(0, 4.5, size=(n_traces, n_samples))
+
+    # Direct wave / shallow ringing with slight lateral wobble.
     for i in range(n_traces):
-        idx = 16 + int(1.8 * np.sin(i / 18))
-        traces[i, max(0, idx - 1):idx + 2] += 85
+        idx = 18 + int(1.4 * np.sin(i / 17.0))
+        amp = 48 + 8 * np.sin(i / 31.0)
+        traces[i, max(0, idx - 1):min(n_samples, idx + 2)] += amp
+        traces[i, max(0, idx + 6):min(n_samples, idx + 9)] -= 0.35 * amp
 
-    # broad natural reflector deeper down
-    for i in range(n_traces):
-        idx = int(205 + 5 * np.sin(i / 28))
-        traces[i, idx - 1:idx + 2] += 45
-
-    # grave shafts: subtle disturbed zones with lower coherence and slight downwarp
-    grave_centers = [45, 92, 145, 188]
-    grave_notes = []
-    for c in grave_centers:
-        width = 12
-        top = 58 + (c % 3) * 3
-        base = 155 + (c % 4) * 5
-        for i in range(max(0, c - width), min(n_traces, c + width + 1)):
-            frac = abs(i - c) / width
-            shaft_top = int(top + 4 * frac)
-            shaft_base = int(base + 8 * frac)
-            traces[i, shaft_top:shaft_base] *= 0.72
-            traces[i, shaft_top:shaft_base] += np.random.normal(0, 10, size=shaft_base - shaft_top)
-        grave_notes.append({"feature": "grave_shaft_like_zone", "trace_center": c, "distance_m": round(float(distance[c]), 2)})
-
-    # coffin-like or compact target hyperbolas, not every grave has one
-    hyperbolas = [
-        {"center": 46, "apex": 92, "scale": 0.065, "amp": 120},
-        {"center": 144, "apex": 96, "scale": 0.055, "amp": 110},
-        {"center": 210, "apex": 118, "scale": 0.045, "amp": 95},  # ambiguous non-grave target
-    ]
-    for h in hyperbolas:
+    # Add weak horizontal banding and shallow clutter to mimic real student data.
+    for base_idx, amp, wobble in [(72, 16, 0.7), (104, 12, 1.0), (176, 14, 1.5), (228, 10, 1.2)]:
         for i in range(n_traces):
+            idx = int(base_idx + wobble * np.sin(i / 20.0) + 0.9 * np.sin(i / 7.5))
+            if 2 <= idx < n_samples - 2:
+                traces[i, idx - 1:idx + 2] += amp
+                traces[i, idx + 3:idx + 5] -= 0.45 * amp
+
+    # Slight trace-to-trace gain drift to avoid a too-clean look.
+    drift = np.linspace(0.92, 1.08, n_traces)[:, None]
+    traces *= drift
+
+    grave_centers = [48, 96, 146, 194]
+    grave_notes = []
+
+    # Disturbed grave shafts: weaker coherence, local attenuation, broken reflectors.
+    for j, c in enumerate(grave_centers):
+        half_width = 9 + (j % 2)
+        top = 54 + 3 * j
+        base = 148 + 8 * (j % 3)
+        for i in range(max(0, c - half_width), min(n_traces, c + half_width + 1)):
+            frac = abs(i - c) / max(half_width, 1)
+            shaft_top = int(top + 2 * frac)
+            shaft_base = int(base + 10 * frac)
+
+            # Disturb and attenuate the shaft, not too strongly.
+            traces[i, shaft_top:shaft_base] *= (0.82 - 0.10 * (1 - frac))
+            traces[i, shaft_top:shaft_base] += rng.normal(0, 5.5, size=shaft_base - shaft_top)
+
+            # Break the shallow reflector inside the grave area.
+            broken_idx = int(72 + 2 * np.sin(i / 8.0) + 1.5 * frac)
+            if 2 <= broken_idx < n_samples - 2:
+                traces[i, broken_idx - 1:broken_idx + 2] *= 0.35
+
+            # Very subtle downwarp beneath some grave shafts.
+            deep_idx = int(176 + 7 * np.exp(-2.6 * frac))
+            if 2 <= deep_idx < n_samples - 2:
+                traces[i, deep_idx - 1:deep_idx + 2] += 7.0
+
+        grave_notes.append({
+            "feature": "grave_shaft_like_zone",
+            "trace_center": c,
+            "distance_m": round(float(distance[c]), 2),
+            "signature": "disturbed zone with broken shallow reflector and mild attenuation",
+        })
+
+    # Only two faint coffin-like hyperbolas. Not every grave gets one.
+    subtle_hyperbolas = [
+        {"center": 49, "apex": 96, "scale": 0.050, "amp": 34},
+        {"center": 147, "apex": 102, "scale": 0.043, "amp": 28},
+    ]
+    for h in subtle_hyperbolas:
+        for i in range(max(0, h["center"] - 34), min(n_traces, h["center"] + 35)):
             idx = int(h["apex"] + h["scale"] * (i - h["center"]) ** 2)
             if 2 <= idx < n_samples - 2:
-                traces[i, idx - 2:idx + 2] += h["amp"]
+                traces[i, idx - 1:idx + 2] += h["amp"]
+                traces[i, idx + 3:idx + 5] -= 0.30 * h["amp"]
 
-    # one disturbed area without a nice hyperbola to teach ambiguity
-    for i in range(112, 132):
-        traces[i, 78:150] *= 0.78
-        traces[i, 78:150] += np.random.normal(0, 12, size=72)
+    # Ambiguous non-grave disturbances.
+    ambiguous_zones = [(118, 133, 84, 142), (214, 228, 92, 160)]
+    for left, right, top, base in ambiguous_zones:
+        for i in range(left, right):
+            traces[i, top:base] *= 0.88
+            traces[i, top:base] += rng.normal(0, 6.0, size=base - top)
 
-    # attenuation with depth
-    attenuation = np.linspace(1.0, 0.38, n_samples)
+    # Add a few weak point targets / roots / stones.
+    for center, apex, scale, amp in [(30, 88, 0.060, 18), (171, 120, 0.038, 22), (232, 108, 0.055, 16)]:
+        for i in range(max(0, center - 20), min(n_traces, center + 21)):
+            idx = int(apex + scale * (i - center) ** 2)
+            if 2 <= idx < n_samples - 2:
+                traces[i, idx - 1:idx + 2] += amp
+
+    # Depth attenuation and mild vertical smoothing for a less cartoon-like appearance.
+    attenuation = np.linspace(1.0, 0.42, n_samples)
     traces *= attenuation[np.newaxis, :]
+    kernel = np.array([0.22, 0.56, 0.22])
+    for i in range(n_traces):
+        traces[i] = np.convolve(traces[i], kernel, mode="same")
 
     metadata = {
         "demo_mode": True,
-        "demo_type": "graveyard_training",
-        "description": "Synthetic cemetery training line with grave-shaft-like disturbances, several coffin-like hyperbolas, and one ambiguous disturbed zone.",
+        "demo_type": "graveyard_training_field_style",
+        "description": "Synthetic cemetery training line rebuilt to resemble messier student field data: weak grave-shaft disturbances, broken reflectors, attenuation changes, subtle hyperbolas, and ambiguous clutter.",
         "n_traces": n_traces,
         "samples_per_trace": n_samples,
-        "teaching_objective": "Students should practice cautious interpretation: disturbed shafts and hyperbolas may suggest graves, but not every anomaly is a burial.",
+        "teaching_objective": "Students should look for disturbed zones and reflector disruption first, not textbook coffin hyperbolas.",
         "grave_like_targets": len(grave_centers),
-        "hyperbola_like_targets": 3,
-        "ambiguous_zone": "Present",
-        "notes": "Synthetic educational data only; not a real cemetery survey.",
+        "hyperbola_like_targets": len(subtle_hyperbolas),
+        "ambiguous_zones": len(ambiguous_zones),
+        "notes": "Synthetic educational data only; intentionally field-like and ambiguous.",
         "feature_preview": grave_notes,
+        "recommended_view": "Try grayscale, modest clipping, and processed radargram view.",
     }
     return GPRData(
         "demo", "graveyard_demo_line.dzt", traces=traces, time_axis=time_ns, distance_axis=distance, metadata=metadata
@@ -584,14 +628,14 @@ def render_sidebar() -> Dict[str, Any]:
 
 def render_file_loader():
     st.subheader("1. Load RADAN Project Files")
-    demo_mode = st.selectbox("Demo mode", ["None", "Generic synthetic line", "Graveyard training line"], index=0)
+    demo_mode = st.selectbox("Demo mode", ["None", "Generic synthetic line", "Graveyard field-style training line"], index=0)
     uploaded = st.file_uploader(
         "Upload one or more related files",
         type=["dzt", "csv", "txt", "asc", "dzg", "dzx", "dza"],
         accept_multiple_files=True,
         help="Upload matching files like line01.dzt, line01.dzg, line01.dzx, and line01.dza together.",
     )
-    mode_map = {"None": "none", "Generic synthetic line": "generic", "Graveyard training line": "graveyard"}
+    mode_map = {"None": "none", "Generic synthetic line": "generic", "Graveyard field-style training line": "graveyard"}
     return mode_map[demo_mode], uploaded
 
 
